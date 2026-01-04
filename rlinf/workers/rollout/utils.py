@@ -393,6 +393,18 @@ class RunningStatusManager:
         self._done_seq_group.clear()
         self.exit_rollout_iter.clear()
 
+    def __enter__(self):
+        num_residual = self.num_seq_group
+        assert num_residual == 0, (
+            f"There are {num_residual} "
+            f"sequence group{'' if num_residual == 1 else 's'} before rollout."
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.clear()
+        return False
+
     def empty(self) -> bool:
         return len(self._running_seq_group) == 0 and len(self._done_seq_group) == 0
 

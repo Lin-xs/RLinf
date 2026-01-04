@@ -61,6 +61,10 @@ class RolloutRequest:
     image_data: Union[list[list[bytes]], list[list[str]]]
     answers: list[Union[list[str], dict]]
     multi_modal_inputs: list[Optional[dict]]
+    uuids: list[uuid.UUID] = None
+
+    def __post_init__(self):
+        self.uuids = self.uuids or [uuid.uuid4() for _ in self.input_ids]
 
     def to_seq_group_infos(self) -> list["SeqGroupInfo"]:
         """Convert the RolloutRequest into a list of SeqGroupInfo objects.
@@ -70,14 +74,15 @@ class RolloutRequest:
         """
         return [
             SeqGroupInfo(
-                id=uuid.uuid4().int,
+                id=uuid_.int,
                 input_ids=input_ids,
                 answer=answer,
                 group_size=self.n,
                 image_data=image_data,
                 multi_modal_inputs=multi_modal_inputs,
             )
-            for input_ids, answer, image_data, multi_modal_inputs in zip(
+            for uuid_, input_ids, answer, image_data, multi_modal_inputs in zip(
+                self.uuids,
                 self.input_ids,
                 self.answers,
                 self.image_data,
@@ -91,6 +96,7 @@ class FinishReasonEnum(str, Enum):
     ABORT = "abort"
     STOP = "stop"
     LENGTH = "length"
+    ABORT_WHEN_WAITING_FOR_TOOL = "abort_when_waiting_for_tool"
 
 
 @dataclass
@@ -107,7 +113,10 @@ class SeqGroupInfo:
         group_size (int): Number of sequences in the group.
         idx_completed (set[int]): Set of indices for sequences that have completed rollout and are ready for evaluation.
         idx_aborted (set[int]): Set of indices for sequences that have been aborted. These sequences need to be re-rolled out before they can be evaluated.
+
+
         results (List[Optional[Dict]]): List storing result dictionaries for each sequence, or None if not yet available.
+
     """
 
     id: int
@@ -116,6 +125,8 @@ class SeqGroupInfo:
     group_size: int
     idx_completed: set[int] = field(init=False, compare=False)
     idx_aborted: set[int] = field(init=False, compare=False)
+    idx_need_agent_response: set[int] = field(init=False, compare=False)
+    requests: list[Optional[RolloutRequest]] = field(init=False, compare=False)
     results: list[Optional[dict]] = field(init=False, compare=False)
     image_data: Optional[list] = None
     multi_modal_inputs: Optional[dict] = None
@@ -124,6 +135,7 @@ class SeqGroupInfo:
         assert self.group_size > 0, "group_size must be greater than 0"
         self.idx_completed = set()
         self.idx_aborted = set()
+        self.requests = [None for _ in range(self.group_size)]
         self.results = [None for _ in range(self.group_size)]
 
     def record_sglang_result(self, idx: int, result: dict, logger=None):
@@ -162,6 +174,24 @@ class SeqGroupInfo:
             self.results[idx] = result
             self.results[idx]["output_ids"] = prev_output_ids + result["output_ids"]
 
+    def record_sglang_result_agent(self, idx: int, result: dict, logger=None):
+        """Record a single sglang execution result that needs agent response and update internal tracking.
+
+        SGLang generation result will only be marked as aborted when needed, because other situation will be handled elsewhere.
+        """
+
+        finished_reason = result["meta_info"]["finish_reason"]["type"]
+        match finished_reason:
+            case FinishReasonEnum.ABORT:
+                self.record_aborted(idx)
+                # result has been processed elsewhere, record directly
+                self.results[idx] = result
+            case FinishReasonEnum.STOP | FinishReasonEnum.LENGTH:
+                # already sent
+                self.results[idx] = None
+            case _:
+                raise ValueError(f"Unknown finish reason: {finished_reason}")
+
     def __hash__(self):
         return self.id
 
@@ -176,9 +206,14 @@ class SeqGroupInfo:
         return len(self.idx_aborted)
 
     @property
+    def num_need_agent_response(self) -> int:
+        """Returns the number of sequences waiting for agent responses."""
+        return len(self.idx_need_agent_response)
+
+    @property
     def num_returned(self) -> int:
         """Returns the total number of sequences that have either completed or aborted."""
-        return self.num_completed + self.num_aborted
+        return self.num_completed + self.num_aborted + self.num_need_agent_response
 
     @property
     def num_running(self) -> int:
@@ -194,6 +229,43 @@ class SeqGroupInfo:
     def all_completed(self) -> bool:
         """Returns True if all sequences have completed."""
         return self.num_completed == self.group_size
+
+    def is_completed(self, idx: int) -> bool:
+        """Check if a specific sequence index has completed."""
+        return idx in self.idx_completed
+
+    def is_aborted(self, idx: int) -> bool:
+        """Check if a specific sequence index has been aborted."""
+        return idx in self.idx_aborted
+
+    def is_need_agent_response(self, idx: int) -> bool:
+        """Check if a specific sequence index is waiting for agent response."""
+        return idx in self.idx_need_agent_response
+
+    def record_completed(self, idx: int):
+        """Mark a specific sequence index as completed."""
+        self.idx_completed.add(idx)
+
+    def record_aborted(self, idx: int):
+        """Mark a specific sequence index as aborted."""
+        self.idx_aborted.add(idx)
+
+    def record_need_agent_response(self, idx: int):
+        """Mark a specific sequence index as waiting for agent response."""
+        self.idx_need_agent_response.add(idx)
+
+    def remove_record(self, idx: int):
+        """Remove the record of a specific sequence index, then pop and return its result."""
+        if idx in self.idx_completed:
+            self.idx_completed.remove(idx)
+        if idx in self.idx_aborted:
+            self.idx_aborted.remove(idx)
+        if idx in self.idx_need_agent_response:
+            self.idx_need_agent_response.remove(idx)
+
+        result = self.results[idx]
+        self.results[idx] = None
+        return result
 
 
 @dataclass(kw_only=True)

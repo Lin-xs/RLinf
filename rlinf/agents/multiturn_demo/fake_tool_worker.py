@@ -50,13 +50,13 @@ class FakeToolWorker(ToolWorker):
             await self.output_channel.put(
                 response, key=session_id, async_op=True
             ).async_wait()
-            self.logger.info("FakeToolWorker._process_requests: sent response")
+            # self.logger.info("FakeToolWorker._process_requests: sent response")
 
         while True:
             request: ToolChannelRequest = await self.input_channel.get(
                 async_op=True
             ).async_wait()
-            self.logger.info("FakeToolWorker._process_requests: got request")
+            # self.logger.info("FakeToolWorker._process_requests: got request")
             assert request.request_type == "execute"
             assert request.tool_name == "fake_tool"
             asyncio.create_task(

@@ -1017,7 +1017,7 @@ class RolloutScalingScheduler:
             # Otherwise, rollout() will continue to run until all tasks are done.
             self.status_manager.notify()
         for group in seq_groups:
-            task = asyncio.create_task(self.worker._async_generate_group(group))
+            task = asyncio.create_task(self.worker.group_rollout_handler(group))
             self.status_manager.add_task(group, task)
 
     async def _wait_for_finish(self):

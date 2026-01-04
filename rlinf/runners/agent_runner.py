@@ -117,6 +117,7 @@ class AgentRunner(ReasoningRunner):
         ).wait()
 
         super().init_workers()
+        self.rollout.set_multiturn_mode(True).wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
@@ -132,9 +133,9 @@ class AgentRunner(ReasoningRunner):
         )
 
         self.run_timer.start_time()
-        self.rollout.rollout_serverless(
-            self.generate_input_channel, self.generate_output_channel
-        )
+        # self.rollout.rollout_serverless(
+        #     self.generate_input_channel, self.generate_output_channel
+        # )
         for tool_worker in self.tool_workers:
             tool_worker.start_server()
         for _ in epoch_iter:
@@ -150,6 +151,11 @@ class AgentRunner(ReasoningRunner):
                     rollout_handle: Handle = self.agent_loop.run_agentloop_rollout(
                         input_channel=self.dataloader_channel,
                         output_channel=self.rollout_channel,
+                    )
+
+                    engine_handle: Handle = self.rollout.rollout(
+                        input_channel=self.generate_input_channel,
+                        output_channel=self.generate_output_channel,
                     )
 
                     # Rewards
@@ -206,6 +212,7 @@ class AgentRunner(ReasoningRunner):
                         return
 
                 time_metrics = self.timer.consume_durations()
+                time_metrics["engine"] = engine_handle.consume_duration()
                 time_metrics["training"] = actor_handle.consume_duration()
                 time_metrics["rollout"] = rollout_handle.consume_duration()
                 time_metrics["reward"] = reward_handle.consume_duration()

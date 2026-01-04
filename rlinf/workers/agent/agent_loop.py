@@ -14,9 +14,9 @@
 
 import asyncio
 import copy
+from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from uuid import uuid4
 
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 from rlinf.data.io_struct import (
     RolloutRequest,
     RolloutResult,
+    SeqGroupInfo,
 )
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -90,21 +91,28 @@ class AgentLoopWorker(Worker):
         self.tool_worker_output_channel = tool_worker_output_channel
 
     async def generate(
-        self, prompt_ids: list[int], sampling_params: Optional[dict] = None
+        self,
+        prompt_ids: list[int],
+        channel_key: str,
+        sampling_params: Optional[dict] = None,
     ):
-        channel_key = uuid4().hex
         await self.generate_input_channel.put(
             {
-                "channel_key": channel_key,
                 "prompt_ids": prompt_ids,
                 "sampling_params": sampling_params,
             },
+            key=channel_key,
             async_op=True,
         ).async_wait()
         result = await self.generate_output_channel.get(
             channel_key, async_op=True
         ).async_wait()
         return result
+
+    async def send_generate_endmark(self, channel_key: str):
+        await self.generate_input_channel.put(
+            None, key=channel_key, async_op=True
+        ).async_wait()
 
     def print_agent_outputs(
         self,
@@ -135,9 +143,7 @@ class AgentLoopWorker(Worker):
 
     async def run_agentloop_rollout_group(
         self,
-        input_ids: list[int],
-        answers: list[Any],
-        group_size: int,
+        seq_group_info: SeqGroupInfo,
         output_channel: Channel,
     ):
         """
@@ -145,12 +151,17 @@ class AgentLoopWorker(Worker):
         """
         rollout_tasks = []
         # grpo group_size
-        for _ in range(group_size):
-            task = asyncio.create_task(self.run_one_query(copy.deepcopy(input_ids)))
+        for i in range(seq_group_info.group_size):
+            task = asyncio.create_task(
+                self.run_one_query(
+                    prompt_ids=copy.deepcopy(seq_group_info.input_ids),
+                    channel_key=f"{seq_group_info.id}_{i}",
+                )
+            )
             rollout_tasks.append(task)
 
         task_results = await asyncio.gather(*rollout_tasks)
-        rollout_result = self.get_rollout_result(task_results, answers)
+        rollout_result = self.get_rollout_result(task_results, seq_group_info.answer)
         await output_channel.put(rollout_result, async_op=True).async_wait()
 
     async def run_agentloop_rollout(
@@ -162,15 +173,13 @@ class AgentLoopWorker(Worker):
         with self.worker_timer():
             rollout_request: RolloutRequest = input_channel.get()
 
+            self.generate_input_channel.put(rollout_request)
+            seq_groups = rollout_request.to_seq_group_infos()
             send_output_tasks = []
-            for input_ids, answers in zip(
-                rollout_request.input_ids, rollout_request.answers
-            ):
+            for group in seq_groups:
                 send_output_tasks.append(
                     asyncio.create_task(
-                        self.run_agentloop_rollout_group(
-                            input_ids, answers, rollout_request.n, output_channel
-                        ),
+                        self.run_agentloop_rollout_group(group, output_channel),
                     )
                 )
 
@@ -225,5 +234,7 @@ class AgentLoopWorker(Worker):
             response_mask=response_mask,
         )
 
-    async def run_one_query(self, prompt_ids: list[int], **kwargs) -> AgentLoopOutput:
-        raise NotImplementedError("Subclasses must implement this method")
+    @abstractmethod
+    async def run_one_query(
+        self, prompt_ids: list[int], channel_key: str, **kwargs
+    ) -> AgentLoopOutput: ...

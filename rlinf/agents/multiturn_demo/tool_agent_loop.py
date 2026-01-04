@@ -98,7 +98,9 @@ class ToolAgentLoopWorker(AgentLoopWorker):
 
         return response_text, return_function_calls
 
-    async def run_one_query(self, prompt_ids: list[int]) -> AgentLoopOutput:
+    async def run_one_query(
+        self, prompt_ids: list[int], channel_key: str
+    ) -> AgentLoopOutput:
         prompt_ids = prompt_ids[: self.max_prompt_len]
         orig_prompt_ids = copy.deepcopy(prompt_ids)
         trace_prints = []
@@ -107,7 +109,9 @@ class ToolAgentLoopWorker(AgentLoopWorker):
             # Generate response from LLM
             max_resp_len = self.max_resp_len - (len(prompt_ids) - len(orig_prompt_ids))
             generate_result = await self.generate(
-                prompt_ids, sampling_params={"max_new_tokens": max_resp_len}
+                prompt_ids,
+                channel_key,
+                sampling_params={"max_new_tokens": max_resp_len},
             )
             response_ids = generate_result["output_ids"]
             if len(response_ids) > max_resp_len:
@@ -149,6 +153,8 @@ class ToolAgentLoopWorker(AgentLoopWorker):
             if self.print_outputs:
                 # add anything you want to print
                 trace_prints[-1]["tool_resp"] = tool_messages
+
+        await self.send_generate_endmark(channel_key)
 
         # Separate prompt and response
         response_ids = prompt_ids[len(orig_prompt_ids) :]

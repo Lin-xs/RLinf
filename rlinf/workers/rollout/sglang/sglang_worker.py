@@ -15,7 +15,7 @@
 import asyncio
 import copy
 import dataclasses
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from omegaconf import DictConfig
 from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
@@ -75,6 +75,16 @@ class SGLangWorker(Worker):
         if self._use_auto_scheduler:
             self._init_scheduler()
 
+        self.is_running: bool = False
+
+        # In multiturn_mode mode, sglang worker will handle multi-turn rollout requests.
+        # Each request will be processed in a separate coroutine with different logic
+        # from normal one-turn rollout.
+        self.multiturn_mode = False
+        self.group_rollout_handler: Callable[
+            [SeqGroupInfo, Channel, Channel], Awaitable[SeqGroupInfo]
+        ] = self._async_generate_group
+
     def _init_scheduler(self):
         self.schedule_channel = self.connect_channel(
             get_scheduler_channel("rollout", self._rank)
@@ -94,6 +104,9 @@ class SGLangWorker(Worker):
         self.async_batch_counter = 0
 
     def _collect_stats(self, engine_results: list[dict]):
+        assert not self.multiturn_mode, (
+            "Meta stats collection in multiturn mode is not supported yet."
+        )
         self.async_meta_stats_collector.collect_batch_stats(
             engine_results, self.async_batch_counter
         )
@@ -222,7 +235,7 @@ class SGLangWorker(Worker):
             prompt=prompt,
             sampling_params=sampling_params,
             input_ids=input_ids,
-            image_data=image_data if any(image_data) else None,
+            image_data=image_data if image_data and any(image_data) else None,
             return_logprob=return_logprob,
         )
         return result, request_info
@@ -239,6 +252,7 @@ class SGLangWorker(Worker):
                 ),
             )
         )
+        self.is_running = True
         self.log_info(f"SGLang worker {self._rank} initialized.")
         if self._cfg.rollout.validate_weight:
             await self._validate_weight_at_first()
@@ -254,6 +268,7 @@ class SGLangWorker(Worker):
         await self._engine.tokenizer_manager.release_memory_occupation(
             obj=ReleaseMemoryOccupationReqInput()
         )
+        self.is_running = False
 
     async def abort_generation(self):
         """Abort the generation."""
@@ -266,6 +281,7 @@ class SGLangWorker(Worker):
         await self._engine.tokenizer_manager.sync_hf_weight(
             obj=io_struct.SyncHFWeightInput()
         )
+        self.is_running = True
 
     async def check_running_state(self):
         state = await self._engine.tokenizer_manager.run_task_method(
@@ -275,8 +291,61 @@ class SGLangWorker(Worker):
 
         return state
 
-    async def _async_generate_group(self, seq_group_info: SeqGroupInfo):
+    async def set_multiturn_mode(self, multiturn_mode: bool = True):
+        """Set the agent mode for multi-turn rollout."""
+        self.multiturn_mode = multiturn_mode
+        self.log_info(f"Set {self.multiturn_mode=}")
+        if self.multiturn_mode:
+            self.group_rollout_handler = self._async_generate_group_multiturn
+        else:
+            self.group_rollout_handler = self._async_generate_group
+
+    async def _async_generate_group(
+        self,
+        seq_group_info: SeqGroupInfo,
+        input_channel: Channel,
+        output_channel: Channel = None,
+    ):
         """Generate a group of responses for a request (for GRPO-like behavior)."""
+
+        async def run_one_query(idx_in_group: int):
+            if seq_group_info.is_completed(idx_in_group):
+                return
+            elif seq_group_info.is_aborted(idx_in_group):
+                partial_result = seq_group_info.remove_record(idx_in_group)
+                generated_ids: list[int] = partial_result["output_ids"]
+                assert len(generated_ids) < self._sampling_params["max_new_tokens"]
+                sampling_params = self._sampling_params.copy()
+                sampling_params["max_new_tokens"] -= len(generated_ids)
+                result, _ = await self.async_generate(
+                    input_ids=seq_group_info.input_ids + generated_ids,
+                    image_data=seq_group_info.image_data,
+                    sampling_params=sampling_params,
+                    return_logprob=self._return_logprobs,
+                )
+
+                result["output_ids"] = (
+                    partial_result["output_ids"] + result["output_ids"]
+                )
+                seq_group_info.record_sglang_result_agent(idx_in_group, result)
+            else:
+                assert not seq_group_info.is_need_agent_response(idx_in_group), (
+                    f"Sequence {idx_in_group} is not expected to need agent response."
+                    f" {self.multiturn_mode=}"
+                )
+                result, _ = await self.async_generate(
+                    input_ids=seq_group_info.input_ids,
+                    image_data=seq_group_info.image_data,
+                    sampling_params=self._sampling_params,
+                    return_logprob=self._return_logprobs,
+                )
+                seq_group_info.record_sglang_result_agent(idx_in_group, result)
+
+        tasks = [run_one_query(i) for i in range(seq_group_info.group_size)]
+        await asyncio.gather(*tasks)
+
+        return seq_group_info
+
         if seq_group_info.num_aborted == 0:
             # No aborted sequences, repeat the input for group_size times
             assert seq_group_info.num_returned == 0
@@ -342,6 +411,105 @@ class SGLangWorker(Worker):
 
         return seq_group_info
 
+    async def _async_generate_group_multiturn(
+        self,
+        seq_group_info: SeqGroupInfo,
+        input_channel: Channel,
+        output_channel: Channel,
+    ):
+        async def send_result(channel_key: str, result: dict):
+            result_dict = {
+                "output_ids": result["output_ids"],
+                "finish_reason": result["meta_info"]["finish_reason"]["type"],
+            }
+            if self._return_logprobs:
+                result_dict["logprobs"] = [
+                    item[0] for item in result["meta_info"]["output_token_logprobs"]
+                ]
+            await output_channel.put(
+                result, key=channel_key, async_op=True
+            ).async_wait()
+
+        async def recover_from_migration_state(idx_in_group: int):
+            """
+            Recover the migration state for a single sequence in a sequence group.
+            This async generator inspects the migration state of the sequence at index
+            `idx_in_group` in `seq_group_info` and yields a single event describing the
+            needed recovery action.
+            """
+            channel_key = f"{seq_group_info.id}_{idx_in_group}"
+            # completed sequence can be skipped
+            if seq_group_info.is_completed(idx_in_group):
+                return
+
+            # aborted sequence needs to be re-rolled out
+            elif seq_group_info.is_aborted(idx_in_group):
+                partial_result = seq_group_info.remove_record(idx_in_group)
+                generated_ids: list[int] = partial_result["output_ids"]
+                assert len(generated_ids) < self._sampling_params["max_new_tokens"]
+                sampling_params = self._sampling_params.copy()
+                sampling_params["max_new_tokens"] -= len(generated_ids)
+                result, _ = await self.async_generate(
+                    input_ids=seq_group_info.input_ids + generated_ids,
+                    image_data=seq_group_info.image_data,
+                    sampling_params=sampling_params,
+                    return_logprob=self._return_logprobs,
+                )
+                # concatenate the previously generated ids and the newly generated ids
+                partial_result["output_ids"].extend(result["output_ids"])
+                partial_result["meta_info"]["finish_reason"] = result["meta_info"][
+                    "finish_reason"
+                ]
+                if "output_token_logprobs" in result["meta_info"]:
+                    partial_result["meta_info"]["output_token_logprobs"].extend(
+                        result["meta_info"]["output_token_logprobs"]
+                    )
+
+                seq_group_info.record_sglang_result_agent(idx_in_group, result)
+                if result["meta_info"]["finish_reason"]["type"] != "aborted":
+                    send_result(channel_key, result)
+
+            # sequence that waits for agent response do not need excessive operations
+            # elif seq_group_info.is_need_agent_response(idx_in_group):
+            #     pass
+
+        async def _run_one_query(idx_in_group: int):
+            channel_key = f"{seq_group_info.id}_{idx_in_group}"
+            while True:
+                if not self.is_running:
+                    seq_group_info.record_need_agent_response(idx_in_group)
+                    return
+                try:
+                    request: RolloutRequest = input_channel.get_nowait(channel_key)
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.5)
+                    continue
+                if request is None:
+                    seq_group_info.record_completed(idx_in_group)
+                    return
+                result, _ = await self.async_generate(
+                    input_ids=request["prompt_ids"],
+                    image_data=request.get("image_data", None),
+                    sampling_params=request.get(
+                        "sampling_params", self._sampling_params
+                    ),
+                    return_logprob=self._return_logprobs,
+                )
+                seq_group_info.record_sglang_result_agent(idx_in_group, result)
+                if result["meta_info"]["finish_reason"]["type"] != "aborted":
+                    await send_result(channel_key, result)
+
+        async def run_one_query(idx_in_group: int):
+            # will try to recover from migration state first
+            # if this seq_group is not a migrated one, this async generator will be empty
+            await recover_from_migration_state(idx_in_group)
+            await _run_one_query(idx_in_group)
+
+        tasks = [run_one_query(i) for i in range(seq_group_info.group_size)]
+        await asyncio.gather(*tasks)
+
+        return seq_group_info
+
     async def rollout(self, input_channel: Channel, output_channel: Channel):
         self.log_on_first_rank("Start generation...")
         request: RolloutRequest = input_channel.get()
@@ -351,33 +519,32 @@ class SGLangWorker(Worker):
             if self._placement.is_pipeline
             else asyncio.ALL_COMPLETED
         )
-        with self.device_lock, self.worker_timer():
-            num_residual = self.status_manager.num_seq_group
-            assert num_residual == 0, (
-                f"There are {num_residual} "
-                f"sequence group{'' if num_residual == 1 else 's'} before rollout."
-            )
-
+        # use device_lock to avoid actor worker loaded before sglang offloading is done
+        # use status_manager to manage async tasks, it will assert no residual tasks
+        # before starting a new rollout turn and clear after done.
+        with self.device_lock, self.worker_timer(), self.status_manager:
             for group in groups:
-                task = asyncio.create_task(self._async_generate_group(group))
+                task = asyncio.create_task(
+                    self.group_rollout_handler(group, input_channel, output_channel)
+                )
                 self.status_manager.add_task(group, task)
 
             all_rollout_results = []
             while pending := self.status_manager.get_running_tasks():
                 done, pending = await asyncio.wait(pending, return_when=async_wait_type)
-                returned_seq_groups: list[SeqGroupInfo] = [
-                    task.result() for task in done
-                ]
-                for group in returned_seq_groups:
+                done_groups: list[SeqGroupInfo] = [task.result() for task in done]
+                for group in done_groups:
                     if group.all_completed:
-                        rollout_result = RolloutResult.from_sglang_seq_group(
-                            group,
-                            self._return_logprobs,
-                        )
-                        all_rollout_results.append(rollout_result)
-                        await output_channel.put(
-                            item=rollout_result, async_op=True
-                        ).async_wait()
+                        if not self.multiturn_mode:
+                            # only collect and send rollout results in one-turn mode
+                            # in multi-turn mode, the results are sent by _async_generate_group_multiturn
+                            rollout_result = RolloutResult.from_sglang_seq_group(
+                                group, self._return_logprobs
+                            )
+                            all_rollout_results.append(rollout_result)
+                            await output_channel.put(
+                                item=rollout_result, async_op=True
+                            ).async_wait()
                         self.status_manager.mark_done(group)
                     else:
                         self.status_manager.mark_aborted(group)
@@ -390,8 +557,6 @@ class SGLangWorker(Worker):
                     # because there might be migrations
                     # if so, `pending` will not be empty in while loop condition
                     await self.status_manager.wait_notification()
-
-            self.status_manager.clear()
 
             if self._collect_meta_stats:
                 self._collect_stats(all_rollout_results)
