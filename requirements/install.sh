@@ -15,6 +15,7 @@ SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 USE_MIRRORS=0
 GITHUB_PREFIX=""
 NO_ROOT=0
+BUILD_APEX=${BUILD_APEX:-0}
 SUPPORTED_TARGETS=("embodied" "reason" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin")
@@ -641,7 +642,14 @@ install_reason() {
         uv pip install -r $SCRIPT_DIR/reason/megatron.txt --no-build-isolation
     fi
 
-    install_prebuilt_apex
+    # try to clone and install apex from source if BUILD_APEX is set
+    if [ "$BUILD_APEX" -eq 1 ]; then
+        apex_dir=$(clone_or_reuse_repo APEX_PATH "$VENV_DIR/apex" https://github.com/NVIDIA/apex.git)
+        uv pip install --link-mode=copy --no-cache-dir --no-build-isolation --config-settings="--global-option=--cpp_ext" --config-settings="--global-option=--cuda_ext" "$apex_dir"
+    else
+        install_prebuilt_apex
+    fi
+
     install_prebuilt_flash_attn
     uv pip uninstall pynvml || true
 }
